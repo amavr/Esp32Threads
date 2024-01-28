@@ -27,27 +27,22 @@ void IRAM_ATTR isrMovement()
 
 void taskMovement(void *pv)
 {
-    int last_state = 0;
     while (true)
     {
-        vTaskSuspend(NULL);
         // xSemaphoreTake(sem, portMAX_DELAY);
+        vTaskSuspend(NULL);
         int motion_sensor = digitalRead(MOTION_PIN);
-        if (last_state != motion_sensor)
+        if (motion_sensor == HIGH)
         {
-            last_state = motion_sensor;
-            if (motion_sensor == HIGH)
-            {
-                digitalWrite(LED_BUILTIN, HIGH);
+            digitalWrite(LED_BUILTIN, HIGH);
 
-                oled.home(); // курсор в 0,0
-                oled.print("MOVE!");
-            }
-            else
-            {
-                digitalWrite(LED_BUILTIN, LOW);
-                oled.clear();
-            }
+            oled.home(); // курсор в 0,0
+            oled.print("MOVE!");
+        }
+        else
+        {
+            digitalWrite(LED_BUILTIN, LOW);
+            oled.clear();
         }
     }
 }
