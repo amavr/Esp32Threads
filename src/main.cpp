@@ -10,16 +10,19 @@ GyverOLED<SSD1306_128x64, OLED_NO_BUFFER> oled;
 SemaphoreHandle_t sem;
 static portMUX_TYPE spin_lock = portMUX_INITIALIZER_UNLOCKED;
 
-void IRAM_ATTR detectsMovement()
+TaskHandle_t ISR = NULL;
+
+void IRAM_ATTR isrMovement()
 {
-    BaseType_t woken = pdFALSE;
-    portENTER_CRITICAL_ISR(&spin_lock);
-    xSemaphoreGiveFromISR(sem, &woken);
-    portEXIT_CRITICAL_ISR(&spin_lock);
-    if (woken)
-    {
-        portYIELD_FROM_ISR(woken);
-    }
+    // portENTER_CRITICAL_ISR(&spin_lock);
+    // static BaseType_t woken = pdFALSE;
+    // xSemaphoreGiveFromISR(sem, &woken);
+    // portEXIT_CRITICAL_ISR(&spin_lock);
+    // if (woken == pdTRUE)
+    // {
+    //     portYIELD_FROM_ISR(woken);
+    // }
+    xTaskResumeFromISR(ISR);
 }
 
 void taskMovement(void *pv)
@@ -27,6 +30,8 @@ void taskMovement(void *pv)
     int last_state = 0;
     while (true)
     {
+        vTaskSuspend(NULL);
+        // xSemaphoreTake(sem, portMAX_DELAY);
         int motion_sensor = digitalRead(MOTION_PIN);
         if (last_state != motion_sensor)
         {
@@ -41,25 +46,17 @@ void taskMovement(void *pv)
             else
             {
                 digitalWrite(LED_BUILTIN, LOW);
-
-                oled.home(); // курсор в 0,0
-                oled.print("Тихо!");
+                oled.clear();
             }
         }
-        vTaskDelay(100);
     }
 }
 
 void setup()
 {
-    Serial.begin(115200);
-    Serial.println("Hello!");
-
     pinMode(MOTION_PIN, INPUT_PULLUP);
-
-    // attachInterrupt(digitalPinToInterrupt(MOTION_PIN), detectsMovement, CHANGE);
-
     pinMode(LED_BUILTIN, OUTPUT);
+
     digitalWrite(LED_BUILTIN, LOW);
 
     oled.init();  // инициализация
@@ -68,11 +65,13 @@ void setup()
 
     oled.setScale(2); // масштаб текста (1..4)
 
-    oled.print("INIT.");
+    oled.print("INIT");
 
-    xTaskCreate(taskMovement, "Motion detection", 4096, NULL, 1, CONFIG_ARDUINO_RUNNING_CORE);
+    xTaskCreatePinnedToCore(taskMovement, "Motion detection", 4096, NULL, 12, &ISR, CONFIG_ARDUINO_RUNNING_CORE);
+    attachInterrupt(digitalPinToInterrupt(MOTION_PIN), isrMovement, CHANGE);
 }
 
 void loop()
 {
+    vTaskDelay(100);
 }
