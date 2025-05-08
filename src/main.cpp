@@ -1,72 +1,153 @@
-#include <Arduino.h>
+#include <WiFi.h>
+#include <DNSServer.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 
-#include <GyverOLED.h>
+// Настройки по умолчанию для точки доступа
+static IPAddress addrAP(192, 168, 4, 1);
 
-#define MOTION_PIN GPIO_NUM_12
-#define MOTION_CALM_DOWN 2000
+static DNSServer dnsServer;
 
-GyverOLED<SSD1306_128x64, OLED_NO_BUFFER> oled;
+// Веб-сервер
+AsyncWebServer server(80);
 
-SemaphoreHandle_t sem;
-static portMUX_TYPE spin_lock = portMUX_INITIALIZER_UNLOCKED;
+// Флаги состояния
+bool connectedToWiFi = false;
+bool apModeActive = false;
 
-TaskHandle_t ISR = NULL;
+const char html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+    <title>WiFi Configuration</title>
+    <style>
+        body {font-family: 'Segoe UI', sans-serif;}
+        span {width: 80px;display: inline-block;text-align: right;margin-right: 8px;}
+        input {border-radius: 4px;border-width: 1px;height: 26px;}
+        div {margin-bottom: 10px;}
+    </style>
+</head>
+<body>
+    <h1>Configure WiFi</h1>
+    <form action="/wifi" method="GET">
+        <div><span>SSID</span><input type="text" name="ssid"></div>
+        <div><span>Password</span><input type="password" name="password"></div>
+        <div><span>&nbsp;</span><input type="submit" value="Connect"></div>
+    </form>
+</body>
+</html>)rawliteral";
 
-void IRAM_ATTR isrMovement()
+// Обработчик подключения к WiFi
+void handleWiFiConnect(const String &ssid, const String &password)
 {
-    // portENTER_CRITICAL_ISR(&spin_lock);
-    // static BaseType_t woken = pdFALSE;
-    // xSemaphoreGiveFromISR(sem, &woken);
-    // portEXIT_CRITICAL_ISR(&spin_lock);
-    // if (woken == pdTRUE)
-    // {
-    //     portYIELD_FROM_ISR(woken);
-    // }
-    xTaskResumeFromISR(ISR);
+    WiFi.begin(ssid.c_str(), password.c_str());
+
+    for (int i = 0; i < 20; i++)
+    {
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            connectedToWiFi = true;
+            apModeActive = false;
+            break;
+        }
+        delay(500);
+    }
 }
 
-void taskMovement(void *pv)
+// Обработчик корневого URL
+void onIndexRequest(AsyncWebServerRequest *request)
 {
-    while (true)
-    {
-        // xSemaphoreTake(sem, portMAX_DELAY);
-        vTaskSuspend(NULL);
-        int motion_sensor = digitalRead(MOTION_PIN);
-        if (motion_sensor == HIGH)
-        {
-            digitalWrite(LED_BUILTIN, HIGH);
+    request->send(200, "text/html", html);
+}
 
-            oled.home(); // курсор в 0,0
-            oled.print("MOVE!");
+// Обработчик формы подключения
+void onWiFiRequest(AsyncWebServerRequest *request)
+{
+    // display params
+    size_t count = request->params();
+    for (size_t i = 0; i < count; i++)
+    {
+        const AsyncWebParameter *p = request->getParam(i);
+        Serial.printf("PARAM[%u]: %s = '%s'\n", i, p->name().c_str(), p->value().c_str());
+    }
+
+    if (request->hasParam("ssid") && request->hasParam("password"))
+    {
+        String ssid = request->getParam("ssid")->value();
+        String password = request->getParam("password")->value();
+        Serial.println(ssid);
+        Serial.println(password);
+
+        handleWiFiConnect(ssid, password);
+
+        if (connectedToWiFi)
+        {
+            request->send(200, "text/plain", "Connected to WiFi!");
         }
         else
         {
-            digitalWrite(LED_BUILTIN, LOW);
-            oled.clear();
+            request->send(500, "text/plain", "Failed to connect");
         }
+    }
+}
+
+// Задача для веб-сервера
+void webServerTask(void *pvParameters)
+{
+    // Инициализация сервера
+    server.on("/", HTTP_GET, onIndexRequest);
+    server.on("/wifi", HTTP_GET, onWiFiRequest);
+    // server.on("/wifi", HTTP_POST, onWiFiRequest);
+    // server.on("/wifi", HTTP_ANY, onWiFiRequest);
+    // server.onNotFound(onIndexRequest);
+    server.begin();
+
+    while (1)
+    {
+        if (!connectedToWiFi)
+        {
+            digitalWrite(BUILTIN_LED, true);
+
+            if (!apModeActive)
+            {
+                dnsServer.start(53, "*", addrAP);
+
+                WiFi.mode(WIFI_AP);
+                IPAddress subnet(255, 255, 255, 0);
+                WiFi.softAPConfig(addrAP, addrAP, subnet);
+                WiFi.softAP("ESP32 Config");
+
+                apModeActive = true;
+
+                server.onNotFound(onIndexRequest);
+
+                Serial.println("AP mode activated");
+            }
+        }
+        else
+        {
+            digitalWrite(BUILTIN_LED, false);
+            Serial.println(WiFi.localIP());
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        // delay(1000);
     }
 }
 
 void setup()
 {
-    pinMode(MOTION_PIN, INPUT_PULLUP);
-    pinMode(LED_BUILTIN, OUTPUT);
+    Serial.begin(115200);
 
-    digitalWrite(LED_BUILTIN, LOW);
+    pinMode(BUILTIN_LED, OUTPUT);
+    digitalWrite(BUILTIN_LED, false);
 
-    oled.init();  // инициализация
-    oled.clear(); // очистка
-    oled.home();  // курсор в 0,0
+    // Инициализация WiFi
+    WiFi.mode(WIFI_STA);
 
-    oled.setScale(2); // масштаб текста (1..4)
-
-    oled.print("INIT");
-
-    xTaskCreatePinnedToCore(taskMovement, "Motion detection", 4096, NULL, 12, &ISR, CONFIG_ARDUINO_RUNNING_CORE);
-    attachInterrupt(digitalPinToInterrupt(MOTION_PIN), isrMovement, CHANGE);
+    // Создание задачи веб-сервера
+    xTaskCreate(webServerTask, "webServerTask", 8192, NULL, 5, NULL);
 }
 
 void loop()
 {
-    vTaskDelay(100);
+    // Основной цикл оставляем пустым
 }
