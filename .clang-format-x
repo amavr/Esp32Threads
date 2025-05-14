@@ -1,0 +1,7 @@
+BasedOnStyle: Microsoft  # или LLVM, Mozilla, WebKit...
+BreakBeforeBraces: Attach  # Фигурная скобка останется на той же строке
+BasedOnStyle: Google  # или LLVM, Mozilla
+IndentWidth: 4        # Размер отступа (4 пробела)
+TabWidth: 4           # Ширина табуляции
+UseTab: Never         # Всегда пробелы
+Language: Cpp

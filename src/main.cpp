@@ -1,19 +1,12 @@
-#include <WiFi.h>
-#include <DNSServer.h>
 #include <AsyncTCP.h>
+#include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>
+#include <WiFi.h>
 
-// Настройки по умолчанию для точки доступа
-static IPAddress addrAP(192, 168, 4, 1);
+#define WIFI_SETTINGS_NAME "wifi"
 
-static DNSServer dnsServer;
-
-// Веб-сервер
-AsyncWebServer server(80);
-
-// Флаги состояния
-bool connectedToWiFi = false;
-bool apModeActive = false;
+SemaphoreHandle_t xWiFiConnectionSemaphore;
 
 const char html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html>
@@ -29,125 +22,180 @@ const char html[] PROGMEM = R"rawliteral(
 <body>
     <h1>Configure WiFi</h1>
     <form action="/wifi" method="GET">
-        <div><span>SSID</span><input type="text" name="ssid"></div>
-        <div><span>Password</span><input type="password" name="password"></div>
+        <div><span>SSID</span><input type="text" name="ssid" value="amavr-d"></div>
+        <div><span>Password</span><input type="password" name="password" value="220666abba"></div>
         <div><span>&nbsp;</span><input type="submit" value="Connect"></div>
     </form>
 </body>
 </html>)rawliteral";
 
 // Обработчик подключения к WiFi
-void handleWiFiConnect(const String &ssid, const String &password)
-{
-    WiFi.begin(ssid.c_str(), password.c_str());
+bool connectWiFi() {
+    WiFi.mode(WIFI_STA);
 
-    for (int i = 0; i < 20; i++)
-    {
-        if (WiFi.status() == WL_CONNECTED)
-        {
-            connectedToWiFi = true;
-            apModeActive = false;
-            break;
-        }
-        delay(500);
+    Preferences prefs;
+    prefs.begin(WIFI_SETTINGS_NAME);
+    String ssid = prefs.getString("ssid");
+    String pass = prefs.getString("pass");
+    prefs.end();
+
+    Serial.println("Prefs");
+    Serial.println(ssid);
+    Serial.println(pass);
+
+    if (ssid.length() == 0) {
+        Serial.println("ssid is empty");
+        return false;
     }
+
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    Serial.println("WiFi.begin");
+
+    for (int i = 0; i < 3; i++) {
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("WiFi status = connected");
+            xSemaphoreGive(xWiFiConnectionSemaphore);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    Serial.println("WiFi status != connected");
+    return false;
 }
 
 // Обработчик корневого URL
-void onIndexRequest(AsyncWebServerRequest *request)
-{
+void onIndexRequest(AsyncWebServerRequest* request) {
     request->send(200, "text/html", html);
 }
 
 // Обработчик формы подключения
-void onWiFiRequest(AsyncWebServerRequest *request)
-{
+void onWiFiRequest(AsyncWebServerRequest* request) {
     // display params
+    Serial.println("GET /wifi?....");
+
     size_t count = request->params();
-    for (size_t i = 0; i < count; i++)
-    {
-        const AsyncWebParameter *p = request->getParam(i);
+    for (size_t i = 0; i < count; i++) {
+        const AsyncWebParameter* p = request->getParam(i);
         Serial.printf("PARAM[%u]: %s = '%s'\n", i, p->name().c_str(), p->value().c_str());
     }
 
-    if (request->hasParam("ssid") && request->hasParam("password"))
-    {
+    if (request->hasParam("ssid") && request->hasParam("password")) {
         String ssid = request->getParam("ssid")->value();
-        String password = request->getParam("password")->value();
-        Serial.println(ssid);
-        Serial.println(password);
+        String pass = request->getParam("password")->value();
 
-        handleWiFiConnect(ssid, password);
+        Preferences prefs;
 
-        if (connectedToWiFi)
-        {
+        prefs.begin(WIFI_SETTINGS_NAME);
+        prefs.putString("ssid", ssid);
+        prefs.putString("pass", pass);
+        prefs.end();
+
+        bool result = connectWiFi();
+
+        if (result) {
             request->send(200, "text/plain", "Connected to WiFi!");
-        }
-        else
-        {
+        } else {
             request->send(500, "text/plain", "Failed to connect");
         }
     }
 }
 
 // Задача для веб-сервера
-void webServerTask(void *pvParameters)
-{
-    // Инициализация сервера
+void webServerTask(void* pvParameters) {
+    Serial.println("BEG::Web server task run");
+
+    // Инициализация серверов HTTP & DNS
+    AsyncWebServer server(80);
+    DNSServer dnsServer;
+
     server.on("/", HTTP_GET, onIndexRequest);
     server.on("/wifi", HTTP_GET, onWiFiRequest);
     // server.on("/wifi", HTTP_POST, onWiFiRequest);
     // server.on("/wifi", HTTP_ANY, onWiFiRequest);
-    // server.onNotFound(onIndexRequest);
+    server.onNotFound(onIndexRequest);
+
     server.begin();
+    Serial.println("BEG::Web server");
 
-    while (1)
-    {
-        if (!connectedToWiFi)
-        {
-            digitalWrite(BUILTIN_LED, true);
+    int cycles = 0;
 
-            if (!apModeActive)
-            {
-                dnsServer.start(53, "*", addrAP);
+    // Настройки по умолчанию для точки доступа
+    IPAddress addrAP(192, 168, 4, 1);
+    bool connected = false;
+    bool is_ap_mode = false;
 
-                WiFi.mode(WIFI_AP);
-                IPAddress subnet(255, 255, 255, 0);
-                WiFi.softAPConfig(addrAP, addrAP, subnet);
-                WiFi.softAP("ESP32 Config");
+    digitalWrite(BUILTIN_LED, true);
+    while (!connected && cycles++ < 60) {
+        if (!is_ap_mode) {
+            // требуется для автоматической переадресации
+            // на HTML страницу ввода SSID & Password
+            dnsServer.start(53, "*", addrAP);
+            Serial.println("BEG::DNS server");
 
-                apModeActive = true;
+            WiFi.mode(WIFI_AP);
+            IPAddress subnet(255, 255, 255, 0);
+            WiFi.softAPConfig(addrAP, addrAP, subnet);
+            WiFi.softAP("ESP32 Config");
 
-                server.onNotFound(onIndexRequest);
+            is_ap_mode = true;
 
-                Serial.println("AP mode activated");
-            }
+            Serial.println("AP mode activated");
         }
-        else
-        {
-            digitalWrite(BUILTIN_LED, false);
-            Serial.println(WiFi.localIP());
-        }
+
         vTaskDelay(pdMS_TO_TICKS(1000));
-        // delay(1000);
+    }
+    server.end();
+    Serial.println("END::Web server");
+    dnsServer.stop();
+    Serial.println("END::DNS server");
+
+    digitalWrite(BUILTIN_LED, false);
+
+    Serial.println("END::Web server task run");
+
+    xSemaphoreGive(xWiFiConnectionSemaphore);
+    vTaskDelete(NULL);
+}
+
+// Задача для веб-сервера
+void wifiConnectionTask(void* pvParameters) {
+    // Инициализация WiFi
+    WiFi.mode(WIFI_STA);
+    // Инициализация семафора
+    xWiFiConnectionSemaphore = xSemaphoreCreateBinary();
+
+    while (1) {
+        if (WiFi.status() != WL_CONNECTED) {
+            if (!connectWiFi()) {
+                xTaskCreate(webServerTask, "webServerTask", 8192, NULL, 5, NULL);
+
+                // Ждём, пока семафор не будет "дан"
+                // (pdMS_TO_TICKS(10000) - максимум 10 секунд, portMAX_DELAY - бесконечно)
+                if (xSemaphoreTake(xWiFiConnectionSemaphore, portMAX_DELAY) == pdTRUE) {
+                    Serial.println("EVT::Семафор получен");
+                } else {
+                    Serial.println("EVT::Семафор таймаут");
+                }
+            }
+        } else {
+            digitalWrite(BUILTIN_LED, true);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            digitalWrite(BUILTIN_LED, false);
+            vTaskDelay(pdMS_TO_TICKS(4800));
+        }
     }
 }
 
-void setup()
-{
+void setup() {
     Serial.begin(115200);
 
     pinMode(BUILTIN_LED, OUTPUT);
     digitalWrite(BUILTIN_LED, false);
 
-    // Инициализация WiFi
-    WiFi.mode(WIFI_STA);
-
-    // Создание задачи веб-сервера
-    xTaskCreate(webServerTask, "webServerTask", 8192, NULL, 5, NULL);
+    // Запуск задачи мониторинга соединения с WiFi
+    xTaskCreate(wifiConnectionTask, "WiFiConnection", 8192, NULL, 5, NULL);
 }
 
-void loop()
-{
+void loop() {
     // Основной цикл оставляем пустым
 }
